@@ -138,20 +138,26 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
         return (this.config.outbounds || []).some(outbound => normalizeGroupName(outbound?.tag) === target);
     }
 
+    hasAutoSelectCandidates(proxyList = this.getProxyList()) {
+        return (Array.isArray(proxyList) && proxyList.length > 0) || this.getAllProviderTags().length > 0;
+    }
+
     addAutoSelectGroup(proxyList) {
         if (!this.includeAutoSelect) return;
         this.config.outbounds = this.config.outbounds || [];
         const tag = this.t('outboundNames.Auto Select');
         if (this.hasOutboundTag(tag)) return;
+        const providerTags = this.getAllProviderTags();
+        const autoSelectMembers = deepCopy(uniqueNames(proxyList));
+        if (autoSelectMembers.length === 0 && providerTags.length === 0) return;
 
         const group = {
             type: "urltest",
             tag,
-            outbounds: deepCopy(uniqueNames(proxyList))
+            outbounds: autoSelectMembers
         };
 
         // Add 'providers' field if we have outbound_providers
-        const providerTags = this.getAllProviderTags();
         if (providerTags.length > 0) {
             group.providers = providerTags;
         }
@@ -163,13 +169,14 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
         this.config.outbounds = this.config.outbounds || [];
         const tag = this.t('outboundNames.Node Select');
         if (this.hasOutboundTag(tag)) return;
+        const includeAutoSelect = this.includeAutoSelect && this.hasAutoSelectCandidates(proxyList);
         const members = buildNodeSelectMembers({
             proxyList,
             translator: this.t,
             groupByCountry: this.groupByCountry,
             manualGroupName: this.manualGroupName,
             countryGroupNames: this.countryGroupNames,
-            includeAutoSelect: this.includeAutoSelect
+            includeAutoSelect
         });
 
         const group = {
@@ -194,7 +201,7 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
             groupByCountry: this.groupByCountry,
             manualGroupName: this.manualGroupName,
             countryGroupNames: this.countryGroupNames,
-            includeAutoSelect: this.includeAutoSelect
+            includeAutoSelect: this.includeAutoSelect && this.hasAutoSelectCandidates(proxyList)
         });
     }
 
@@ -222,7 +229,17 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
     addCustomRuleGroups(proxyList) {
         if (Array.isArray(this.customRules)) {
             this.customRules.forEach(rule => {
-                const selectorMembers = this.buildSelectorMembers(proxyList);
+                const includeAutoSelect = this.includeAutoSelect && this.hasAutoSelectCandidates(proxyList);
+                // Custom rules should not include country groups as direct outbounds
+                // to prevent them from acting as global proxies.
+                // Custom rules should route through: Node Select -> Country Groups
+                const selectorMembers = [
+                    this.t('outboundNames.Node Select'),
+                    ...(includeAutoSelect ? [this.t('outboundNames.Auto Select')] : []),
+                    ...(this.manualGroupName ? [this.manualGroupName] : []),
+                    'DIRECT',
+                    'REJECT'
+                ];
                 if (this.hasOutboundTag(rule.name)) return;
                 this.config.outbounds.push({
                     type: "selector",
@@ -267,6 +284,7 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
 
         const countries = Object.keys(countryGroups).sort((a, b) => a.localeCompare(b));
         const countryGroupNames = [];
+        const includeAutoSelect = this.includeAutoSelect && this.hasAutoSelectCandidates();
 
         countries.forEach(country => {
             const { emoji, name, proxies: countryProxies } = countryGroups[country];
@@ -295,7 +313,7 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
                 groupByCountry: true,
                 manualGroupName,
                 countryGroupNames,
-                includeAutoSelect: this.includeAutoSelect
+                includeAutoSelect
             });
             nodeSelectGroup.outbounds = rebuilt;
         }
@@ -397,6 +415,7 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
     validateOutbounds() {
         const proxyList = this.getProxyList();
         const providerTags = this.getAllProviderTags();
+        const invalidTags = new Set();
 
         (this.config.outbounds || []).forEach(outbound => {
             // For urltest groups, ensure they have outbounds or providers
@@ -409,8 +428,23 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
                 if (providerTags.length > 0) {
                     outbound.providers = [...providerTags];
                 }
+                if ((!outbound.outbounds || outbound.outbounds.length === 0) &&
+                    (!outbound.providers || outbound.providers.length === 0)) {
+                    invalidTags.add(normalizeGroupName(outbound.tag));
+                }
             }
         });
+
+        if (invalidTags.size > 0) {
+            this.config.outbounds = (this.config.outbounds || [])
+                .filter(outbound => !invalidTags.has(normalizeGroupName(outbound?.tag)))
+                .map(outbound => {
+                    if (Array.isArray(outbound.outbounds)) {
+                        outbound.outbounds = outbound.outbounds.filter(tag => !invalidTags.has(normalizeGroupName(tag)));
+                    }
+                    return outbound;
+                });
+        }
     }
 
     formatConfig() {
@@ -429,44 +463,63 @@ export class SingboxConfigBuilder extends BaseConfigBuilder {
         // Validate outbounds: fill empty urltest groups with all proxies
         this.validateOutbounds();
 
-        rules.filter(rule => !!rule.domain_suffix || !!rule.domain_keyword).map(rule => {
-            this.config.route.rules.push({
-                domain_suffix: rule.domain_suffix,
-                domain_keyword: rule.domain_keyword,
-                protocol: rule.protocol,
+        const attachProtocolIfNeeded = (entry, rule) => {
+            if (Array.isArray(rule?.protocol) && rule.protocol.length > 0) {
+                entry.protocol = rule.protocol;
+            }
+            return entry;
+        };
+
+        const hasMatchValues = (value) => {
+            if (Array.isArray(value)) return value.length > 0;
+            if (typeof value === 'string') return value.trim() !== '';
+            return false;
+        };
+
+        rules.filter(rule => Array.isArray(rule.src_ip_cidr) && rule.src_ip_cidr.length > 0).map(rule => {
+            this.config.route.rules.push(attachProtocolIfNeeded({
+                source_ip_cidr: rule.src_ip_cidr,
                 outbound: this.t(`outboundNames.${rule.outbound}`)
-            });
+            }, rule));
+        });
+
+        rules.filter(rule => hasMatchValues(rule.domain_suffix) || hasMatchValues(rule.domain_keyword)).map(rule => {
+            const entry = {
+                outbound: this.t(`outboundNames.${rule.outbound}`)
+            };
+
+            if (hasMatchValues(rule.domain_suffix)) entry.domain_suffix = rule.domain_suffix;
+            if (hasMatchValues(rule.domain_keyword)) entry.domain_keyword = rule.domain_keyword;
+
+            this.config.route.rules.push(attachProtocolIfNeeded(entry, rule));
         });
 
         rules.filter(rule => !!rule.site_rules[0]).map(rule => {
-            this.config.route.rules.push({
+            this.config.route.rules.push(attachProtocolIfNeeded({
                 rule_set: [
                     ...(rule.site_rules.length > 0 && rule.site_rules[0] !== '' ? rule.site_rules : []),
                 ],
-                protocol: rule.protocol,
                 outbound: this.t(`outboundNames.${rule.outbound}`)
-            });
+            }, rule));
         });
 
         rules.filter(rule => !!rule.ip_rules[0]).map(rule => {
-            this.config.route.rules.push({
+            this.config.route.rules.push(attachProtocolIfNeeded({
                 rule_set: [
                     ...(rule.ip_rules
                         .map(ip => ip.trim())
                         .filter(ip => ip !== '')
                         .map(ip => `${ip}-ip`))
                 ],
-                protocol: rule.protocol,
                 outbound: this.t(`outboundNames.${rule.outbound}`)
-            });
+            }, rule));
         });
 
-        rules.filter(rule => !!rule.ip_cidr).map(rule => {
-            this.config.route.rules.push({
+        rules.filter(rule => hasMatchValues(rule.ip_cidr)).map(rule => {
+            this.config.route.rules.push(attachProtocolIfNeeded({
                 ip_cidr: rule.ip_cidr,
-                protocol: rule.protocol,
                 outbound: this.t(`outboundNames.${rule.outbound}`)
-            });
+            }, rule));
         });
 
         this.config.route.rules.unshift(

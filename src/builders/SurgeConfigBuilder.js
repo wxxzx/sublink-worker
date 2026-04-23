@@ -296,8 +296,17 @@ export class SurgeConfigBuilder extends BaseConfigBuilder {
     addCustomRuleGroups(proxyList) {
         if (Array.isArray(this.customRules)) {
             this.customRules.forEach(rule => {
-                const options = this.buildAggregatedOptions(proxyList);
                 if (this.hasProxyGroup(rule.name)) return;
+                // Custom rules should not include country groups as direct options
+                // to prevent them from acting as global proxies.
+                // Custom rules should route through: Node Select -> Country Groups
+                const options = [
+                    this.t('outboundNames.Node Select'),
+                    ...(this.includeAutoSelect ? [this.t('outboundNames.Auto Select')] : []),
+                    ...(this.manualGroupName ? [this.manualGroupName] : []),
+                    'DIRECT',
+                    'REJECT'
+                ];
                 this.config['proxy-groups'].push(
                     this.createProxyGroup(rule.name, 'select', options)
                 );
@@ -414,6 +423,25 @@ export class SurgeConfigBuilder extends BaseConfigBuilder {
 
         // Rule-Set & Domain Rules & IP Rules:  To reduce DNS leaks and unnecessary DNS queries,
         // domain & non-IP rules must precede IP rules
+
+        rules.filter(rule => Array.isArray(rule.src_ip_cidr) && rule.src_ip_cidr.length > 0).map(rule => {
+            rule.src_ip_cidr.forEach(cidr => {
+                const value = typeof cidr === 'string' ? cidr.trim() : cidr;
+                if (!value) return;
+
+                const safeValue = typeof value === 'string' ? value.replace(/[\r\n]+/g, '').trim() : value;
+                if (!safeValue) return;
+
+                // Surge supports SRC-IP (single IP). Best-effort: downgrade /32 CIDR to SRC-IP.
+                if (typeof safeValue === 'string' && safeValue.endsWith('/32')) {
+                    finalConfig.push(`SRC-IP,${safeValue.slice(0, -3)},${this.t('outboundNames.' + rule.outbound)}`);
+                } else if (typeof safeValue === 'string' && !safeValue.includes('/')) {
+                    finalConfig.push(`SRC-IP,${safeValue},${this.t('outboundNames.' + rule.outbound)}`);
+                } else if (typeof safeValue === 'string' && safeValue.includes('/')) {
+                    finalConfig.push(`# SRC-IP-CIDR not supported by Surge, skipped: ${safeValue}`);
+                }
+            });
+        });
 
         rules.filter(rule => !!rule.domain_suffix).map(rule => {
             rule.domain_suffix.forEach(suffix => {
